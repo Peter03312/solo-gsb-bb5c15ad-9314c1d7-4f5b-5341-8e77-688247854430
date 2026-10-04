@@ -10,6 +10,8 @@ TypeScript / Node.js + PostgreSQL 实现的危险货箱三维舱位配载审定�
 
 调度员还可从航次当前修订号建立多个相互独立的**试排方案（stowage plan）**：每个方案以创建时布局为初值、固定当时安全约束快照，记录来源修订号与独立的方案修订号；方案内整批调整沿用正式航次同一套箱号/坐标/最终布局校验规则，按方案修订号防止并发覆盖，失败不改变方案，且**正式航次、清单与核对作业不受试排影响**。仅当航次当前修订号仍等于方案来源修订号时方可**发布**：方案布局原子写入航次新修订号并继承方案约束；否则报告冲突且保留方案。发布成功后方案只读，重复发布幂等返回首次发布结果。
 
+航次修订号前进导致无法发布时，调度员可提交**方案 ID、所见方案修订号与所见航次修订号**把未发布方案**迁移（rebase）到当前航次**：以方案来源修订号的正式布局为**共同基线逐箱三方合并**——仅一方改动（含撤位）采用该方位置，双方改动到同一位置（含双方撤位）视为一致，目标不同则返回冲突箱号及双方位置、方案保持原状；撤位按空位置参与比较。合并后的完整布局用**当前航次约束**复验，违反返回现有规则明细且不迁移。成功后原子更新方案来源修订号与约束快照、保存合并布局、推进方案修订号，旧方案布局仍在方案历史中可追溯；**再次迁移以新的来源修订号为基线**。迁移不改变正式布局、清单与核对作业，迁移后发布仍遵守现有发布冲突与重复发布幂等规则。
+
 ---
 
 ## 1. 模型与规则
@@ -89,6 +91,7 @@ d = |Δbay| + |Δrow| + |Δtier|
 - **查询**：`GET /api/plans/:planId` 返回当前试排布局、固定约束与版本（`sourceRevision`/`planRevision`/`status`）；未知方案 404 `plan_not_found`；`GET /api/voyages/:id/plans` 列出航次下全部方案；
 - **发布**：`POST /api/plans/:planId/publish` 仅当**航次当前修订号仍等于方案来源修订号**才受理——同一事务内把方案布局写入航次新修订号（rev+1）、新修订号继承方案约束快照、方案置 `published` 只读；航次修订号已偏离 → 409 `publish_conflict`，**方案原样保留**（仍为 `open`，可继续调整或基于最新修订号另建方案）；
 - **发布后**：方案只读（继续调整 → 409 `plan_published`）；重复发布幂等返回**首次发布结果**（200 `replay:true`，不产生新修订号）；
+- **迁移（航次前进后的 rebase）**：`POST /api/plans/:planId/migrate` 提交所见方案修订号与航次修订号，以**来源修订号正式布局为共同基线逐箱三方合并**（仅一方改动取该方、双方改到同位置一致、目标不同返回冲突箱及双方位置、撤位按空位置比较），合并布局按**当前航次约束**复验；冲突或复验失败均不改变方案，成功则原子换来源修订号+约束快照、保存合并布局、方案修订号 +1（旧方案布局留痕可追溯），再次迁移以新来源修订号为基线；所见版本过期或方案已发布拒绝；**迁移不改变正式布局、清单与核对作业**，迁移后发布仍遵守现有冲突与重复发布规则；
 - **隔离与冻结**：试排不触碰正式航次、清单与核对作业；历史布局、旧清单与在办核对仍遵循原有冻结语义，发布产生的新修订号与正式调整产生的修订号完全同构（历史可查、可签发、可开工核对）。
 
 ---
@@ -152,6 +155,7 @@ npm run build && node test/e2e.js             # 配载/签发/并发
 npm run build && node test/e2e-check.js       # 核对作业/上报/结案/并发
 npm run build && node test/e2e-constraints.js # 安全约束变更/历史留痕/冻结基准/并发
 npm run build && node test/e2e-plans.js       # 试排方案/发布冲突/只读幂等/并发
+npm run build && node test/e2e-migrate.js    # 方案迁移/三方合并/冲突/复验失败/过期/并发
 ```
 
 ---
@@ -182,6 +186,7 @@ npm run build && node test/e2e-plans.js       # 试排方案/发布冲突/只读
 | `GET` | `/api/plans/:planId` | 查询方案（当前试排布局 + 固定约束 + 版本） |
 | `POST` | `/api/plans/:planId/moves` | **方案内整批调整**（携带方案修订号） |
 | `POST` | `/api/plans/:planId/publish` | **发布方案**（原子写入航次新修订号；冲突 409 保留方案） |
+| `POST` | `/api/plans/:planId/migrate` | **方案迁移到当前航次**（三方合并；携带所见方案/航次修订号） |
 | `GET` | `/health` | 健康检查（含数据库连通性） |
 
 ### 4.1 登记航次
@@ -445,6 +450,67 @@ curl -sS -X POST http://localhost:3000/api/plans/<planId>/publish
 - 已发布方案重复发布 → 200 `replay:true`，返回**首次发布结果**（同一 `voyageRevision` 与 `publishedAt`，不产生新修订号）；
 - 发布产生的新修订号与正式调整完全同构：历史布局可查、可据此签发清单、可开启核对作业；既有历史布局、旧清单与在办核对保持冻结。
 
+### 4.9 方案迁移（航次前进后的 rebase，`POST /api/plans/:planId/migrate`）
+
+航次修订号前进导致 `publish` 返回 `publish_conflict` 时，调度员不必丢弃方案重做，可把方案**迁移到当前航次**。请求体提交所见的两个修订号：
+
+```json
+{ "planRevision": 1, "voyageRevision": 2 }
+```
+
+- `planRevision`：调度员所见**方案修订号**（`GET /api/plans/:planId` 的 `planRevision`）；
+- `voyageRevision`：调度员所见**航次修订号**（`GET /api/voyages/:id` 的 `revision`）。
+
+**逐箱三方合并**（共同基线＝方案**来源修订号的正式布局**；两方＝方案当前布局、航次当前布局；任一布局中缺失的箱按**空位置**即撤位处理）：
+
+| 情形 | 合并结果 |
+| --- | --- |
+| 双方都未相对基线改动 | 沿用基线位置 |
+| 仅方案方改动（含撤位） | 采用**方案**位置 |
+| 仅航次方改动（含撤位） | 采用**航次**位置（追上正式布局） |
+| 双方改动到**同一位置**（含双方都撤位） | 视为一致，采用该位置 |
+| 双方都改动且**目标不同**（一方撤位、一方移动也算） | **冲突**：返回箱号 + `planPosition` + `voyagePosition`，方案保持原状 |
+
+合并后的**完整布局**用**当前航次修订号的约束**复验五项配载规则。成功后在同一事务内：
+
+1. `source_rev` 更新为当前航次修订号（**再次迁移即以该新来源修订号为基线**）；
+2. 方案约束快照整体替换为当前航次修订号版本（方案固定快照随之换版）；
+3. 合并布局写入新的方案修订号（`planRevision + 1`），**旧方案修订号布局在方案历史中继续留痕**；
+4. 方案仍为 `open`，不触碰正式航次、清单与核对作业。
+
+成功响应（200）：
+
+```json
+{
+  "migrated": true,
+  "planId": "…", "voyageId": "…",
+  "previousSourceRevision": 1, "sourceRevision": 2,
+  "previousPlanRevision": 1, "planRevision": 2,
+  "voyageRevision": 2,
+  "merge": {
+    "totalBoxes": 5, "unchanged": 2, "planOnly": 1,
+    "voyageOnly": 2, "bothSame": 0,
+    "conflictCount": 0, "conflicts": []
+  },
+  "plan": { "sourceRevision": 2, "planRevision": 2, "status": "open", "placements": [ … ], … }
+}
+```
+
+**拒绝情形（均不改变方案与正式航次）**：
+
+| 场景 | 状态 / 错误码 | 说明 |
+| --- | --- | --- |
+| 所见方案修订号过期 | 409 `stale_revision` | `details.scope:"plan"`、`details.currentRevision` 为方案当前修订号 |
+| 所见航次修订号过期 | 409 `stale_revision` | `details.scope:"voyage"`、`details.currentRevision` 为航次当前修订号 |
+| 方案已发布 | 409 `plan_published` | 已发布方案只读，无需迁移 |
+| 来源修订号仍等于航次当前修订号 | 409 `migration_not_needed` | 航次未前进，可直接发布；`details` 含双方修订号 |
+| 双方改动目标不同 | 409 `migration_conflict` | `details.conflicts[]`：`{boxNo, planPosition, voyagePosition}`（撤位一方位置为 `null`），方案保持原状；调度员在方案内调整冲突箱后可重试 |
+| 合并布局违反当前航次约束 | 422 `validation_failed` | 与整批调整同构的 `violations[]`（箱号/位置/原因），**不迁移** |
+| 请求体非法 / 方案 ID 非法 | 400 | `invalid_request_body` / `invalid_plan_id` |
+| 方案不存在 | 404 `plan_not_found` | — |
+
+> 迁移只重定方案基线与方案快照，**不产生航次修订号、不改变正式布局/清单/核对作业**；迁移后方案的 `sourceRevision` 等于航次当前修订号，即可按 4.8 节正常发布，发布仍遵守 `publish_conflict` 与重复发布幂等规则。
+
 ### 状态码约定
 
 | 状态 | 场景 |
@@ -452,8 +518,8 @@ curl -sS -X POST http://localhost:3000/api/plans/<planId>/publish
 | 200 / 201 | 查询成功 / 创建或首次签发、首次受理上报、首次结案成功、首次发布方案（幂等重试返回 200） |
 | 400 | 请求体非法、未知箱、坐标越界、同批重复箱号；约束变更的非正承重/越界列坐标/重复类别对或重复列覆盖；方案 ID 格式非法 |
 | 404 | 航次/修订号/清单/核对作业/试排方案不存在（含以未签发清单开工） |
-| 409 | 修订号过期（整批调整、约束变更、签发、方案内调整共用）；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案；方案已发布（`plan_published`）、航次修订号偏离方案来源（`publish_conflict`） |
-| 422 | 配载规则违反整批拒绝（整批调整、约束变更复验、方案内调整）；或尚有箱未配位即签发 |
+| 409 | 修订号过期（整批调整、约束变更、签发、方案内调整、**方案迁移（分方案/航次两个 scope）**共用）；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案；方案已发布（`plan_published`）、航次修订号偏离方案来源（`publish_conflict`）、**方案迁移双方改动目标不同（`migration_conflict`）或无需迁移（`migration_not_needed`）** |
+| 422 | 配载规则违反整批拒绝（整批调整、约束变更复验、方案内调整、**方案迁移按当前航次约束复验**）；或尚有箱未配位即签发 |
 | 503 | `/health` 数据库不可达 |
 
 ---
@@ -484,6 +550,12 @@ curl -sS -X POST http://localhost:3000/api/plans/<planId>/publish
   BASE=http://localhost:3000 bash examples/plans-curl.sh
   ```
 
+- `examples/migrate-curl.sh` —— 方案迁移全流程 curl（航次前进后发布冲突→提交方案/航次所见修订号迁移：逐箱合并成功→换基线发布→双方目标不同 409 冲突保持原状→所见版本过期 409）：
+
+  ```bash
+  BASE=http://localhost:3000 bash examples/migrate-curl.sh
+  ```
+
 - `examples/api.http` —— REST Client / JetBrains HTTP Client 文件（含核对段落）；
 - `examples/demo.ts` —— Node 示例（内置 fetch）：
 
@@ -497,11 +569,11 @@ curl -sS -X POST http://localhost:3000/api/plans/<planId>/publish
 
 ```
 src/
-  domain.ts        领域模型 + 纯函数规则校验（最终布局五项规则、请求级检查、十进制重量）
+  domain.ts        领域模型 + 纯函数规则校验（最终布局五项规则、请求级检查、十进制重量、迁移三方合并）
   check.ts         装船核对纯函数（最后上报汇总、应装/已核对/缺失/错位/清单外、结案条件）
   service.ts       事务编排：乐观修订号、整批调整、签发冻结、并发互斥
   check-service.ts 核对作业事务：开工/上报幂等与冲突/留痕/状态/结案冻结（行级互斥）
-  plan-service.ts  试排方案事务：建立快照/方案内整批调整/查询/发布（方案行 + 航次行互斥）
+  plan-service.ts  试排方案事务：建立快照/方案内整批调整/查询/发布/迁移rebase（方案行 + 航次行互斥）
   db.ts            连接池、等待就绪、幂等建表
   schema.sql       PostgreSQL 表结构（航次/列限/箱/不相容规则/修订布局/清单/核对作业与上报/试排方案）
   http/            Express 路由与 zod 请求校验
@@ -509,10 +581,12 @@ src/
 test/
   validator.test.ts  配载规则单元测试（node --test）
   check.test.ts      核对纯函数单元测试
+  merge.test.ts      方案迁移三方合并纯函数单元测试（一方改动/双方同位/撤位/冲突）
   e2e.js             对真实 PostgreSQL 的端到端/并发验证（开发辅助）
   e2e-check.js       核对作业端到端/并发验证（开发辅助）
   e2e-constraints.js 安全约束变更端到端/历史留痕/并发验证（开发辅助）
   e2e-plans.js       试排方案端到端/发布冲突/只读幂等/并发验证（开发辅助）
+  e2e-migrate.js     方案迁移端到端/三方合并/冲突/复验失败/过期/连续迁移/并发（开发辅助）
 examples/          curl / .http / Node 调用示例
 Dockerfile  docker-compose.yml
 ```

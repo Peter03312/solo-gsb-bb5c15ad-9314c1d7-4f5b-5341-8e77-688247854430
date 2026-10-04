@@ -110,6 +110,16 @@ export const createPlanSchema = z
  * 直接复用 applyMovesSchema。
  */
 
+/**
+ * 方案迁移（航次修订号前进后的 rebase）：
+ * 提交方案 ID（路径参数）、所见方案修订号 planRevision 与所见航次修订号 voyageRevision。
+ * 服务以方案来源修订号布局为共同基线逐箱三方合并；过期/已发布/冲突/复验失败均不改变方案。
+ */
+export const migratePlanSchema = z.object({
+  planRevision: nonNegativeInt,
+  voyageRevision: nonNegativeInt,
+});
+
 // ---- 现场装船核对 ----
 
 export const openCheckJobSchema = z.object({

@@ -184,3 +184,16 @@ Content-Type: application/json
 ### 发布方案：航次当前修订号仍等于方案来源修订号时原子写入航次新修订号并继承方案约束；
 ### 否则 409 publish_conflict 且方案保留；已发布方案重复发布幂等返回首次结果
 POST {{host}}/api/plans/{{planId}}/publish
+
+### 方案迁移（航次修订号前进导致无法发布时）：
+### 提交所见方案修订号 planRevision 与所见航次修订号 voyageRevision；
+### 以来源修订号正式布局为共同基线逐箱三方合并（仅一方改动取该方、双方同位一致、目标不同 409 冲突）；
+### 撤位按空位置比较；按当前航次约束复验（违反 422 不迁移）；
+### 成功原子换来源修订号+约束快照、保存合并布局、方案修订号 +1；旧方案布局可追溯
+POST {{host}}/api/plans/{{planId}}/migrate
+Content-Type: application/json
+
+{
+  "planRevision": 1,
+  "voyageRevision": 2
+}

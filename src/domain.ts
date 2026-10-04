@@ -352,3 +352,107 @@ export function validateLayout(input: ValidateLayoutInput): Violation[] {
 function comparePosition(a: Position, b: Position): number {
   return a.bay - b.bay || a.row - b.row || a.tier - b.tier;
 }
+
+/** 两位置是否同一（null 表示撤位/未配位的空位置） */
+export function samePosition(a: Position | null, b: Position | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.bay === b.bay && a.row === b.row && a.tier === b.tier;
+}
+
+/** 方案迁移的逐箱合并冲突：双方都改动且目标不同（撤位按空位置参与比较） */
+export interface MergeConflict {
+  boxNo: string;
+  /** 方案方位置（null=撤位/未配位） */
+  planPosition: Position | null;
+  /** 航次方（当前正式布局）位置（null=撤位/未配位） */
+  voyagePosition: Position | null;
+}
+
+export interface ThreeWayMergeInput {
+  /** 全部箱号（箱档案登记后不可变，方案与正式航次共用同一份） */
+  boxNos: string[];
+  /** 共同基线：方案来源修订号的正式布局（每个已配位箱一条） */
+  base: Placement[];
+  /** 一方：方案当前试排布局 */
+  plan: Placement[];
+  /** 另一方：航次当前修订号的正式布局 */
+  voyage: Placement[];
+}
+
+export interface ThreeWayMergeResult {
+  /** 合并后的完整布局（仅已配位箱） */
+  placements: Placement[];
+  /** 目标不同的冲突箱（双方都改动）；非空表示方案保持原状、不迁移 */
+  conflicts: MergeConflict[];
+  /** 合并统计 */
+  stats: {
+    totalBoxes: number;
+    unchanged: number;
+    /** 仅方案方改动（含撤位） */
+    planOnly: number;
+    /** 仅航次方改动（含撤位），合并后采用航次位置 */
+    voyageOnly: number;
+    /** 双方改动到同一位置（含双方撤位），视为一致 */
+    bothSame: number;
+    /** 双方改动且目标不同的冲突箱数 */
+    conflicts: number;
+  };
+}
+
+function placementMap(placements: Placement[]): Map<string, Position> {
+  return new Map(placements.map((p) => [p.boxNo, p.position]));
+}
+
+/**
+ * 航次修订号前进后的方案迁移：以方案来源修订号的正式布局为共同基线逐箱三方合并。
+ * 对每个箱（base/plan/voyage 中缺失即视为空位置=撤位）：
+ *  - 仅一方相对基线改动（含撤位）：采用该方位置；
+ *  - 双方改动到同一位置（含双方都撤位）：视为一致，采用该位置；
+ *  - 双方都改动且目标不同：记为冲突箱（返回双方位置），整体不迁移、方案保持原状；
+ *  - 双方都未改动（含相对基线的一致值）：沿用基线位置。
+ */
+export function threeWayMerge(input: ThreeWayMergeInput): ThreeWayMergeResult {
+  const base = placementMap(input.base);
+  const plan = placementMap(input.plan);
+  const voyage = placementMap(input.voyage);
+
+  const merged: Placement[] = [];
+  const conflicts: MergeConflict[] = [];
+  const stats = {
+    totalBoxes: input.boxNos.length,
+    unchanged: 0,
+    planOnly: 0,
+    voyageOnly: 0,
+    bothSame: 0,
+    conflicts: 0,
+  };
+
+  for (const boxNo of [...input.boxNos].sort((a, b) => a.localeCompare(b))) {
+    const bp = base.get(boxNo) ?? null;
+    const pp = plan.get(boxNo) ?? null;
+    const vp = voyage.get(boxNo) ?? null;
+    const planChanged = !samePosition(pp, bp);
+    const voyageChanged = !samePosition(vp, bp);
+
+    if (planChanged && voyageChanged) {
+      if (samePosition(pp, vp)) {
+        stats.bothSame++;
+        if (pp !== null) merged.push({ boxNo, position: pp });
+      } else {
+        stats.conflicts++;
+        conflicts.push({ boxNo, planPosition: pp, voyagePosition: vp });
+      }
+    } else if (planChanged) {
+      stats.planOnly++;
+      if (pp !== null) merged.push({ boxNo, position: pp });
+    } else if (voyageChanged) {
+      stats.voyageOnly++;
+      if (vp !== null) merged.push({ boxNo, position: vp });
+    } else {
+      stats.unchanged++;
+      if (bp !== null) merged.push({ boxNo, position: bp });
+    }
+  }
+
+  return { placements: merged, conflicts, stats };
+}
