@@ -110,6 +110,15 @@ export const createPlanSchema = z
  * 直接复用 applyMovesSchema。
  */
 
+/**
+ * 方案迁移：航次修订号前进导致无法发布时，把未发布方案合并迁移到当前航次修订号。
+ * 携带调度员所见的方案修订号与航次修订号，二者均需与当前值一致才受理。
+ */
+export const migratePlanSchema = z.object({
+  seenPlanRevision: nonNegativeInt,
+  seenVoyageRevision: nonNegativeInt,
+});
+
 // ---- 现场装船核对 ----
 
 export const openCheckJobSchema = z.object({

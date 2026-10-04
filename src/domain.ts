@@ -200,6 +200,102 @@ export interface ValidateLayoutInput {
   rules: Map<string, number>;
 }
 
+/* ---------- 方案迁移：以来源修订号正式布局为共同基线的逐箱三路合并 ---------- */
+
+export interface MigrationConflict {
+  boxNo: string;
+  /** 方案侧目标位置（撤位为 null） */
+  planPosition: Position | null;
+  /** 正式航次侧目标位置（撤位为 null） */
+  voyagePosition: Position | null;
+}
+
+export interface MergeLayoutsInput {
+  /** 共同基线：方案来源修订号的正式布局（撤位/未配位以缺省表示） */
+  baseline: Placement[];
+  /** 方案当前布局（未发布） */
+  plan: Placement[];
+  /** 航次当前修订号的正式布局 */
+  current: Placement[];
+  /** 需要参与比较的全部箱号（箱档案；缺省时取三方箱号并集） */
+  boxNos?: string[];
+}
+
+export interface MergeLayoutsResult {
+  /** 合并后的完整布局（每个已配位箱一条，按箱号排序） */
+  placements: Placement[];
+  /** 双方目标不同的冲突箱（按箱号排序） */
+  conflicts: MigrationConflict[];
+}
+
+/** 位置可空相等（null 表示撤位/未配位） */
+export function sameNullablePosition(a: Position | null, b: Position | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.bay === b.bay && a.row === b.row && a.tier === b.tier;
+}
+
+function placementMap(placements: Placement[]): Map<string, Position | null> {
+  const map = new Map<string, Position | null>();
+  for (const p of placements) map.set(p.boxNo, p.position);
+  return map;
+}
+
+/**
+ * 试排方案迁移到当前航次修订号的逐箱合并（纯函数）。
+ *
+ * 以方案来源修订号的正式布局为共同基线，对每个箱比较“方案当前布局”与“航次当前布局”：
+ *  - 仅一方相对基线改动（含撤位）：采用该方位置；
+ *  - 双方都改动且目标相同（含同撤一空位）：视为一致，采用该位置；
+ *  - 双方都改动但目标不同：记为冲突（方案保持原状，由调用方整批拒绝）；
+ *  - 双方均未改动：沿用基线位置。
+ * 撤位以 null（缺省）位置参与全部比较。
+ */
+export function mergeLayouts(input: MergeLayoutsInput): MergeLayoutsResult {
+  const baseline = placementMap(input.baseline);
+  const plan = placementMap(input.plan);
+  const current = placementMap(input.current);
+
+  const boxSet = new Set<string>([
+    ...baseline.keys(),
+    ...plan.keys(),
+    ...current.keys(),
+    ...(input.boxNos ?? []),
+  ]);
+
+  const merged = new Map<string, Position | null>();
+  const conflicts: MigrationConflict[] = [];
+
+  for (const boxNo of boxSet) {
+    const basePos = baseline.get(boxNo) ?? null;
+    const planPos = plan.get(boxNo) ?? null;
+    const voyagePos = current.get(boxNo) ?? null;
+    const planChanged = !sameNullablePosition(planPos, basePos);
+    const voyageChanged = !sameNullablePosition(voyagePos, basePos);
+
+    if (planChanged && voyageChanged) {
+      if (sameNullablePosition(planPos, voyagePos)) {
+        merged.set(boxNo, planPos); // 双方改到同一位置（含同撤一空位）
+      } else {
+        conflicts.push({ boxNo, planPosition: planPos, voyagePosition: voyagePos });
+      }
+    } else if (planChanged) {
+      merged.set(boxNo, planPos);
+    } else if (voyageChanged) {
+      merged.set(boxNo, voyagePos);
+    } else {
+      merged.set(boxNo, basePos);
+    }
+  }
+
+  const placements: Placement[] = [...merged.entries()]
+    .filter((entry): entry is [string, Position] => entry[1] !== null)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([boxNo, position]) => ({ boxNo, position }));
+  conflicts.sort((a, b) => a.boxNo.localeCompare(b.boxNo));
+
+  return { placements, conflicts };
+}
+
 /**
  * 按最终布局一次性校验全部配载规则。
  * 返回所有违反项（空数组表示通过）：

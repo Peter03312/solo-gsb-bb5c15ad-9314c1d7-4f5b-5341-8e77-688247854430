@@ -10,6 +10,7 @@ import {
   createPlanSchema,
   createVoyageSchema,
   issueManifestSchema,
+  migratePlanSchema,
   openCheckJobSchema,
   updateConstraintsSchema,
 } from './schemas';
@@ -212,6 +213,17 @@ export function createApiRouter(
     planService
       .publish(planId)
       .then((v) => res.status(v.replay ? 200 : 201).json(v))
+      .catch(next);
+  });
+
+  // 迁移方案：航次前进导致无法发布时，以来源修订号正式布局为共同基线逐箱合并到当前航次修订号；
+  // 携带所见方案修订号与所见航次修订号；冲突 409 migration_conflict 保留方案，复验违规 422 不迁移
+  router.post('/plans/:planId/migrate', (req, res, next) => {
+    const planId = parsePlanId(req);
+    const input = parseBody(migratePlanSchema, req.body);
+    planService
+      .migrate(planId, input)
+      .then((v) => res.status(200).json(v))
       .catch(next);
   });
 

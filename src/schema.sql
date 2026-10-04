@@ -161,7 +161,8 @@ CREATE TABLE IF NOT EXISTS plan_placements (
 CREATE INDEX IF NOT EXISTS idx_plan_placements_rev ON plan_placements (plan_id, rev);
 
 -- 方案创建时固定的安全约束快照（默认列承重 / 按列覆盖 / 不相容类别对）：
--- 复制自来源修订号，方案存续期间不变；方案内调整与发布复验均使用这套约束。
+-- 复制自来源修订号；迁移（migrate）成功后在同一事务内整套刷新为航次当前修订号快照。
+-- 方案内调整与发布复验均使用这套约束；正式航次不感知方案与方案迁移。
 CREATE TABLE IF NOT EXISTS plan_constraint_defaults (
     plan_id      UUID PRIMARY KEY REFERENCES stowage_plans(id) ON DELETE CASCADE,
     weight_limit BIGINT NOT NULL CHECK (weight_limit > 0) -- 微千克

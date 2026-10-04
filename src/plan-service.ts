@@ -10,6 +10,7 @@ import {
   Violation,
   checkMoves,
   columnKey,
+  mergeLayouts,
   microToWeight,
   ruleKey,
   validateLayout,
@@ -26,6 +27,13 @@ export interface PlanMovesInput {
   /** 调度员所见的方案修订号（方案内乐观并发，与航次修订号序列独立） */
   baseRevision: number;
   moves: Move[];
+}
+
+export interface MigratePlanInput {
+  /** 调度员所见的方案修订号（方案内乐观并发） */
+  seenPlanRevision: number;
+  /** 调度员所见的航次修订号（必须等于航次当前修订号） */
+  seenVoyageRevision: number;
 }
 
 interface PlanRow {
@@ -167,6 +175,60 @@ async function loadPlanData(client: PoolClient, plan: PlanRow, v: VoyageRow): Pr
   };
 }
 
+/** 航次某修订号的完整正式布局（迁移共同基线/当前布局） */
+async function loadVoyagePlacements(
+  client: PoolClient,
+  voyageId: string,
+  rev: number,
+): Promise<Placement[]> {
+  const res = await client.query(
+    `SELECT box_no, bay, row, tier FROM placements WHERE voyage_id=$1 AND rev=$2 ORDER BY box_no`,
+    [voyageId, rev],
+  );
+  return res.rows.map((r) => ({
+    boxNo: r.box_no as string,
+    position: { bay: r.bay, row: r.row, tier: r.tier } as Position,
+  }));
+}
+
+/** 航次某修订号生效的安全约束快照（迁移复验与方案快照刷新使用） */
+async function loadVoyageConstraints(
+  client: PoolClient,
+  voyageId: string,
+  rev: number,
+): Promise<PlanConstraints> {
+  const [defRes, limitRes, ruleRes] = await Promise.all([
+    client.query(
+      `SELECT weight_limit::text AS weight_limit FROM constraint_defaults WHERE voyage_id=$1 AND rev=$2`,
+      [voyageId, rev],
+    ),
+    client.query(
+      `SELECT bay, row, weight_limit::text AS weight_limit
+       FROM constraint_column_limits WHERE voyage_id=$1 AND rev=$2 ORDER BY bay,row`,
+      [voyageId, rev],
+    ),
+    client.query(
+      `SELECT cat_a, cat_b, min_distance
+       FROM constraint_incompat_rules WHERE voyage_id=$1 AND rev=$2 ORDER BY cat_a,cat_b`,
+      [voyageId, rev],
+    ),
+  ]);
+
+  const defRow = defRes.rows[0];
+  if (!defRow) {
+    throw new Error(`航次 ${voyageId} 缺少修订号 ${rev} 的约束快照（数据不一致）`);
+  }
+  const columnLimits = new Map<string, bigint>();
+  for (const r of limitRes.rows) {
+    columnLimits.set(columnKey(r.bay as number, r.row as number), BigInt(r.weight_limit as string));
+  }
+  const rules = new Map<string, number>();
+  for (const r of ruleRes.rows) {
+    rules.set(ruleKey(r.cat_a as string, r.cat_b as string), Number(r.min_distance));
+  }
+  return { defaultLimit: BigInt(defRow.weight_limit as string), columnLimits, rules };
+}
+
 /* ---------- 服务 ---------- */
 
 /**
@@ -174,6 +236,8 @@ async function loadPlanData(client: PoolClient, plan: PlanRow, v: VoyageRow): Pr
  *  - 建立：以创建时布局为初值、固定当时约束快照，记录来源修订号与独立的方案修订号；
  *  - 调整：方案内整批调整沿用正式航次的箱号/坐标/最终布局校验规则，按方案修订号防并发覆盖；
  *  - 发布：仅当航次当前修订号仍等于方案来源修订号，才把方案布局原子写入航次新修订号并继承方案约束；
+ *  - 迁移：航次修订号前进后，以来源修订号正式布局为共同基线逐箱合并到当前航次修订号，
+ *    原子推进来源修订号、刷新约束快照并保存新布局（方案修订号 +1），不触碰正式航次；
  *  - 正式航次、清单与核对作业不感知试排方案的存在。
  */
 export class PlanService {
@@ -564,6 +628,208 @@ export class PlanService {
         voyageRevision: nextRev,
         publishedAt: publishedPlan.published_at ? publishedPlan.published_at.toISOString() : null,
         layout: this.serializeVoyageLayout({ ...v, rev: nextRev }, nextRev, data),
+      };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * 航次修订号前进导致无法发布时，把未发布方案迁移到航次当前修订号（原子）：
+   *  - 携带所见方案修订号与所见航次修订号；方案已发布 -> 409 plan_published；
+   *    所见方案修订号过期 -> 409 stale_revision（返回方案当前修订号）；
+   *    所见航次修订号与航次当前修订号不符 -> 409 stale_revision（返回航次当前修订号）；
+   *  - 来源修订号已等于当前修订号 -> 200 migrated:false（already_current），方案原样返回；
+   *  - 以【方案来源修订号的正式布局】为共同基线逐箱三路合并：仅一方改动取该方位置，
+   *    双方改到同一位置视为一致，目标不同（撤位按空位置参与比较）-> 409 migration_conflict，
+   *    返回每个冲突箱号与双方位置，方案保持原状；
+   *  - 合并后的完整布局按【航次当前修订号约束】复验；违规 -> 422 validation_failed，不迁移；
+   *  - 成功后同事务：方案来源修订号推进到当前航次修订号、约束快照刷新为当前航次快照、
+   *    合并布局保存为新的方案修订号（旧方案布局按方案修订号留痕仍可追溯），方案修订号 +1；
+   *  - 不改变正式布局、清单与核对作业；再次迁移以新的来源修订号为基线。
+   */
+  async migrate(planId: string, input: MigratePlanInput) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const plan = await loadPlanRow(client, planId, true);
+      if (!plan) throw HttpError.notFound('plan_not_found', `试排方案 ${planId} 不存在`);
+      if (plan.status === 'published') {
+        throw HttpError.conflict(
+          'plan_published',
+          `试排方案已发布（写入航次修订号 ${plan.published_rev}）并转为只读，拒绝迁移`,
+          { planId, publishedRevision: plan.published_rev, publishedAt: plan.published_at },
+        );
+      }
+      if (!Number.isInteger(input.seenPlanRevision) || input.seenPlanRevision < 0) {
+        throw HttpError.badRequest('invalid_revision', 'seenPlanRevision 必须为非负整数');
+      }
+      if (plan.rev !== input.seenPlanRevision) {
+        throw new HttpError(
+          409,
+          'stale_revision',
+          `所见方案修订号已过期：携带的 ${input.seenPlanRevision} 与方案当前修订号 ${plan.rev} 不一致，请重新读取方案后再提交迁移`,
+          {
+            scope: 'plan',
+            planId,
+            expectedRevision: input.seenPlanRevision,
+            currentRevision: plan.rev,
+          },
+        );
+      }
+      if (!Number.isInteger(input.seenVoyageRevision) || input.seenVoyageRevision < 0) {
+        throw HttpError.badRequest('invalid_revision', 'seenVoyageRevision 必须为非负整数');
+      }
+
+      const v = await loadVoyageRow(client, plan.voyage_id, true);
+      if (!v) throw HttpError.notFound('voyage_not_found', `航次 ${plan.voyage_id} 不存在`);
+      if (v.rev !== input.seenVoyageRevision) {
+        throw new HttpError(
+          409,
+          'stale_revision',
+          `所见航次修订号已过期：携带的 ${input.seenVoyageRevision} 与航次当前修订号 ${v.rev} 不一致，请重新读取航次布局后再提交迁移`,
+          {
+            scope: 'voyage',
+            planId,
+            expectedRevision: input.seenVoyageRevision,
+            currentRevision: v.rev,
+          },
+        );
+      }
+
+      // 来源修订号已是当前修订号：无需迁移，方案原样返回
+      if (plan.source_rev === v.rev) {
+        const data = await loadPlanData(client, plan, v);
+        await client.query('COMMIT');
+        return {
+          migrated: false,
+          reason: 'already_current',
+          planId: plan.id,
+          voyageId: plan.voyage_id,
+          sourceRevision: plan.source_rev,
+          previousSourceRevision: plan.source_rev,
+          planRevision: plan.rev,
+          previousPlanRevision: plan.rev,
+          voyageRevision: v.rev,
+          conflictCount: 0,
+          plan: this.serializePlan(plan, data),
+        };
+      }
+
+      const geometry: Geometry = { bays: v.n_bays, rows: v.n_rows, tiers: v.n_tiers };
+      const boxes = await loadBoxes(client, plan.voyage_id);
+      const [planPlacements, baselinePlacements, currentPlacements, currentConstraints] =
+        await Promise.all([
+          loadPlanPlacements(client, plan.id, plan.rev),
+          loadVoyagePlacements(client, plan.voyage_id, plan.source_rev),
+          loadVoyagePlacements(client, plan.voyage_id, v.rev),
+          loadVoyageConstraints(client, plan.voyage_id, v.rev),
+        ]);
+
+      // 以方案来源修订号正式布局为共同基线逐箱合并
+      const { placements: mergedPlacements, conflicts } = mergeLayouts({
+        baseline: baselinePlacements,
+        plan: planPlacements,
+        current: currentPlacements,
+        boxNos: boxes.map((b) => b.boxNo),
+      });
+      if (conflicts.length > 0) {
+        throw HttpError.conflict(
+          'migration_conflict',
+          `方案与航次自来源修订号 ${plan.source_rev} 以来对 ${conflicts.length} 个箱的改动目标不同，迁移已拒绝，方案保持原状`,
+          {
+            planId,
+            sourceRevision: plan.source_rev,
+            currentRevision: v.rev,
+            planRevision: plan.rev,
+            conflictCount: conflicts.length,
+            conflicts,
+          },
+        );
+      }
+
+      // 用当前航次约束复验合并后的完整布局：违规不迁移
+      const violations: Violation[] = validateLayout({
+        geometry,
+        boxes,
+        placements: mergedPlacements,
+        columnLimits: currentConstraints.columnLimits,
+        defaultColumnLimit: currentConstraints.defaultLimit,
+        rules: currentConstraints.rules,
+      });
+      if (violations.length > 0) {
+        throw HttpError.validationFailed(violations);
+      }
+
+      const nextPlanRev = plan.rev + 1;
+
+      // 保存合并布局为新的方案修订号（旧方案布局仍可追溯）
+      if (mergedPlacements.length > 0) {
+        const values: string[] = [];
+        const params: (string | number)[] = [plan.id, nextPlanRev];
+        let i = 3;
+        for (const p of mergedPlacements) {
+          values.push(`($1, $2, $${i++}, $${i++}, $${i++}, $${i++})`);
+          params.push(p.boxNo, p.position.bay, p.position.row, p.position.tier);
+        }
+        await client.query(
+          `INSERT INTO plan_placements (plan_id, rev, box_no, bay, row, tier) VALUES ${values.join(',')}`,
+          params,
+        );
+      }
+
+      // 方案约束快照刷新为当前航次修订号快照（每方案一份，整套替换）
+      await client.query(`DELETE FROM plan_constraint_defaults WHERE plan_id=$1`, [plan.id]);
+      await client.query(`DELETE FROM plan_constraint_column_limits WHERE plan_id=$1`, [plan.id]);
+      await client.query(`DELETE FROM plan_constraint_incompat_rules WHERE plan_id=$1`, [plan.id]);
+      await client.query(
+        `INSERT INTO plan_constraint_defaults (plan_id, weight_limit)
+         SELECT $1, weight_limit FROM constraint_defaults WHERE voyage_id=$2 AND rev=$3`,
+        [plan.id, plan.voyage_id, v.rev],
+      );
+      await client.query(
+        `INSERT INTO plan_constraint_column_limits (plan_id, bay, row, weight_limit)
+         SELECT $1, bay, row, weight_limit FROM constraint_column_limits WHERE voyage_id=$2 AND rev=$3`,
+        [plan.id, plan.voyage_id, v.rev],
+      );
+      await client.query(
+        `INSERT INTO plan_constraint_incompat_rules (plan_id, cat_a, cat_b, min_distance)
+         SELECT $1, cat_a, cat_b, min_distance FROM constraint_incompat_rules WHERE voyage_id=$2 AND rev=$3`,
+        [plan.id, plan.voyage_id, v.rev],
+      );
+
+      // 原子推进方案来源修订号与方案修订号（正式航次修订号不变）
+      await client.query(`UPDATE stowage_plans SET source_rev=$2, rev=$3 WHERE id=$1`, [
+        plan.id,
+        v.rev,
+        nextPlanRev,
+      ]);
+
+      await client.query('COMMIT');
+
+      const migratedPlan: PlanRow = { ...plan, source_rev: v.rev, rev: nextPlanRev };
+      const migratedData: PlanData = {
+        geometry,
+        boxes,
+        constraints: currentConstraints,
+        placements: mergedPlacements,
+      };
+      return {
+        migrated: true,
+        reason: 'migrated',
+        planId: plan.id,
+        voyageId: plan.voyage_id,
+        sourceRevision: v.rev,
+        previousSourceRevision: plan.source_rev,
+        planRevision: nextPlanRev,
+        previousPlanRevision: plan.rev,
+        voyageRevision: v.rev,
+        conflictCount: 0,
+        plan: this.serializePlan(migratedPlan, migratedData),
       };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
